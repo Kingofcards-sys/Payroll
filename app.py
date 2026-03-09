@@ -288,6 +288,7 @@ if attendance_input and salary_input:
             'weekoff_paid_leave',
             'daily_working_hours',
             'total_expected_hours',
+            'daily_worked_list',
             'total_worked_hours',
             'salary_hour',
             'base_salary',
