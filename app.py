@@ -1,8 +1,10 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from io import BytesIO
+import re
 
 # Page config
 st.set_page_config(page_title="TPay Payroll System", layout="wide")
@@ -128,11 +130,11 @@ def parse_tanka_attendance(df):
 # ============================================================================
 # HELPER FUNCTIONS - BIOMETRIC PARSER
 # ============================================================================
-def parse_biometric_attendance(df):
-    """Parse Biometric format attendance data (nested Excel structure)"""
-    
+def parse_biometric_attendance(df, source_name=None):
+    """Parse Biometric format attendance data from employee-wise monthly blocks."""
+
     def calc_work_hours(in_t, out_t):
-        """Calculate work hours from in and out times"""
+        """Calculate work hours from in and out times."""
         if not in_t or not out_t or ":" not in str(in_t) or ":" not in str(out_t):
             return "0:00"
         try:
@@ -143,66 +145,107 @@ def parse_biometric_attendance(df):
             sec = diff.total_seconds()
             if sec < 0:
                 sec += 86400
-            return f"{int(sec//3600)}:{int((sec%3600)//60):02d}"
-        except Exception as e:
+            return f"{int(sec // 3600)}:{int((sec % 3600) // 60):02d}"
+        except Exception:
             return "0:00"
-    
+
+    def extract_value(row, label):
+        for val in row:
+            text = str(val).strip()
+            if label in text:
+                return text.split(":", 1)[1].strip()
+        return None
+
+    def split_attendance_cell(cell_value):
+        if pd.isna(cell_value):
+            return []
+        return [part.strip() for part in str(cell_value).split("\n")]
+
+    def infer_period_from_source(name):
+        if not name:
+            return datetime.now().year, datetime.now().month
+
+        base_name = str(name)
+
+        # Supports names like 03-2026, 03_2026, 2026-03, 04-03-2026, etc.
+        month_year = re.search(r'(?<!\d)(0?[1-9]|1[0-2])[-_/](20\d{2})(?!\d)', base_name)
+        if month_year:
+            return int(month_year.group(2)), int(month_year.group(1))
+
+        year_month = re.search(r'(?<!\d)(20\d{2})[-_/](0?[1-9]|1[0-2])(?!\d)', base_name)
+        if year_month:
+            return int(year_month.group(1)), int(year_month.group(2))
+
+        full_date = re.search(r'(?<!\d)(0?[1-9]|[12]\d|3[01])[-_/](0?[1-9]|1[0-2])[-_/](20\d{2})(?!\d)', base_name)
+        if full_date:
+            return int(full_date.group(3)), int(full_date.group(2))
+
+        return datetime.now().year, datetime.now().month
+
     records = []
+    year, month = infer_period_from_source(source_name)
     current_emp_id = None
     current_emp_name = None
-    
-    # Extract year and month from data or use current
-    year = datetime.now().year
-    month = datetime.now().month
-    
-    for idx, row in df.iterrows():
-        row_str = " ".join(row.astype(str))
-        
-        # Capture Employee Details
+    current_day_numbers = {}
+
+    for _, row in df.iterrows():
+        row_str = " ".join(row.fillna("").astype(str))
+        first_cell = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+
         if "Emp Code :" in row_str:
-            for val in row:
-                text = str(val)
-                if "Emp Code :" in text:
-                    current_emp_id = text.split(":")[1].strip()
-                if "Emp Name :" in text:
-                    current_emp_name = text.split(":")[1].strip()
+            current_emp_id = extract_value(row, "Emp Code")
+            current_emp_name = extract_value(row, "Emp Name")
+            current_day_numbers = {}
             continue
-        
-        # Identify the row containing attendance data
-        if isinstance(row.iloc[0], str) and "Shift" in row.iloc[0]:
-            for day_num in range(1, len(df.columns)):
-                cell_val = row.iloc[day_num]
-                if pd.notna(cell_val) and "\n" in str(cell_val):
-                    parts = str(cell_val).split("\n")
-                    if len(parts) >= 8:
-                        try:
-                            date_obj = datetime(year, month, day_num)
-                            in_t = parts[1].strip()
-                            out_t = parts[2].strip()
-                            
-                            records.append({
-                                "employee_id": current_emp_id,
-                                "emp_id": current_emp_id,
-                                "emp_name": current_emp_name,
-                                "date": date_obj.strftime("%Y-%m-%d"),
-                                "day_name": date_obj.strftime("%A"),
-                                "in_time": in_t,
-                                "out_time": out_t,
-                                "work_hours": parts[6].strip(),
-                                "calc_hrs": calc_work_hours(in_t, out_t),
-                                "status": parts[7].strip()
-                            })
-                        except Exception:
-                            continue
-    
+
+        if current_emp_id and any(str(val).strip().isdigit() for val in row.iloc[1:] if pd.notna(val)):
+            current_day_numbers = {}
+            for col_idx in range(1, len(row)):
+                value = str(row.iloc[col_idx]).strip() if pd.notna(row.iloc[col_idx]) else ""
+                if value.isdigit():
+                    current_day_numbers[col_idx] = int(value)
+            continue
+
+        if current_emp_id and first_cell.startswith("In Time"):
+            for col_idx, day_num in current_day_numbers.items():
+                parts = split_attendance_cell(row.iloc[col_idx])
+                if not parts:
+                    continue
+
+                padded_parts = (parts + [""] * 6)[:6]
+                in_t, out_t, late_mins, early_dep, work_hours, status = padded_parts
+
+                try:
+                    date_obj = datetime(year, month, day_num)
+                except ValueError:
+                    continue
+
+                calc_hrs = calc_work_hours(in_t, out_t)
+                effective_hours = work_hours if work_hours and work_hours != "0:00" else calc_hrs
+
+                records.append({
+                    "employee_id": current_emp_id,
+                    "emp_id": current_emp_id,
+                    "emp_name": current_emp_name,
+                    "date": date_obj.strftime("%Y-%m-%d"),
+                    "day_name": date_obj.strftime("%A"),
+                    "in_time": in_t,
+                    "out_time": out_t,
+                    "late_mins": late_mins,
+                    "early_dep": early_dep,
+                    "work_hours": work_hours,
+                    "calc_hrs": calc_hrs,
+                    "effective_hours": effective_hours,
+                    "status": status
+                })
+
     attendance_df = pd.DataFrame(records)
-    
-    if len(attendance_df) == 0:
+
+    if attendance_df.empty:
         return attendance_df
-    
-    # Normalize work hours
-    attendance_df['Normalized_Work_Hrs'] = attendance_df['calc_hrs'].apply(get_normalized_hours)
-    
+
+    attendance_df["Normalized_Work_Hrs"] = attendance_df["effective_hours"].apply(get_normalized_hours)
+
     return attendance_df
 
 # ============================================================================
@@ -231,12 +274,15 @@ if data_source == "Tanka Pay":
             st.dataframe(final_df.head(10), use_container_width=True)
             
             # Download button for cleaned attendance
-            cleaned_csv = final_df.to_csv(index=False)
+            cleaned_buffer = BytesIO()
+            with pd.ExcelWriter(cleaned_buffer, engine='openpyxl') as writer:
+                final_df.to_excel(writer, index=False, sheet_name='Attendance')
+            cleaned_buffer.seek(0)
             st.download_button(
                 label="📥 Download Cleaned Attendance File",
-                data=cleaned_csv,
-                file_name="cleaned_attendance_tanka.csv",
-                mime="text/csv",
+                data=cleaned_buffer,
+                file_name="cleaned_attendance_tanka.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="download_cleaned_tanka"
             )
             
@@ -249,7 +295,7 @@ if data_source == "Tanka Pay":
 
 else:  # Biometric
     st.subheader("🔍 Biometric Format")
-    st.caption("Expected format: Nested Excel structure with Emp Code, Emp Name, and Shift rows with daily data")
+    st.caption("Expected format: Employee-wise monthly blocks with Emp Code, Emp Name, day-number row, and multiline daily attendance cells")
     
     attendance_file = st.file_uploader(
         "📁 Upload Biometric Attendance File (.xlsx)",
@@ -262,7 +308,7 @@ else:  # Biometric
         
         try:
             df = pd.read_excel(attendance_file)
-            final_df = parse_biometric_attendance(df)
+            final_df = parse_biometric_attendance(df, attendance_file.name)
             
             if len(final_df) == 0:
                 st.warning("⚠️ No attendance records found. Please check the file format.")
@@ -271,12 +317,15 @@ else:  # Biometric
                 st.dataframe(final_df.head(10), use_container_width=True)
                 
                 # Download button for cleaned attendance
-                cleaned_csv = final_df.to_csv(index=False)
+                cleaned_buffer = BytesIO()
+                with pd.ExcelWriter(cleaned_buffer, engine='openpyxl') as writer:
+                    final_df.to_excel(writer, index=False, sheet_name='Attendance')
+                cleaned_buffer.seek(0)
                 st.download_button(
                     label="📥 Download Cleaned Attendance File",
-                    data=cleaned_csv,
-                    file_name="cleaned_attendance_biometric.csv",
-                    mime="text/csv",
+                    data=cleaned_buffer,
+                    file_name="cleaned_attendance_biometric.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_cleaned_bio"
                 )
                 
@@ -305,7 +354,7 @@ with col1:
 
 with col2:
     salary_input = st.file_uploader(
-        "📁 Upload Salary Master File (.xlsx)",
+        "📁 Upload Salary Master File (.xlsx) column names emp_id	,daily_working_hours,	salary",
         type=["xlsx"],
         key="salary_input"
     )
@@ -320,6 +369,12 @@ if attendance_input and salary_input:
         spd = pd.read_excel(attendance_input)
     
     salarypd = pd.read_excel(salary_input)
+    salarypd.columns = salarypd.columns.str.strip()
+
+    normalized_salary_cols = {}
+    for col in salarypd.columns:
+        normalized_key = col.strip().lower().replace(" ", "_")
+        normalized_salary_cols[normalized_key] = col
     
     # Identify the employee ID column in both dataframes
     # Normalize: use 'employee_id' if available, otherwise look for OrgEmpCode or emp_id
@@ -344,6 +399,19 @@ if attendance_input and salary_input:
     else:
         st.error("❌ Could not find employee ID column in salary file")
         st.stop()
+
+    if "salary" not in salarypd.columns:
+        salary_source_col = normalized_salary_cols.get("salary")
+        if salary_source_col:
+            salarypd["salary"] = salarypd[salary_source_col]
+
+    if "daily_working_hours" not in salarypd.columns:
+        hours_source_col = (
+            normalized_salary_cols.get("daily_working_hours")
+            or normalized_salary_cols.get("daily_working_hour")
+        )
+        if hours_source_col:
+            salarypd["daily_working_hours"] = salarypd[hours_source_col]
     
     # Normalize salary dataframe to have 'employee_id' column
     if emp_id_col_salary != 'employee_id':
@@ -358,9 +426,10 @@ if attendance_input and salary_input:
         )
     )
     
-    # Rename for consistency
-    grouped_df['employee_id'] = grouped_df[emp_id_col_spd]
-    grouped_df = grouped_df.drop(columns=[emp_id_col_spd])
+    # Keep a stable merge key for biometric data without dropping it accidentally.
+    if emp_id_col_spd != 'employee_id':
+        grouped_df['employee_id'] = grouped_df[emp_id_col_spd]
+        grouped_df = grouped_df.drop(columns=[emp_id_col_spd])
     
     # Merge with salary data
     payroll_df = grouped_df.merge(
@@ -368,6 +437,13 @@ if attendance_input and salary_input:
         on="employee_id",
         how="left"
     )
+
+    missing_salary_ids = payroll_df.loc[payroll_df["salary"].isna(), "employee_id"].tolist() if "salary" in payroll_df.columns else payroll_df["employee_id"].tolist()
+    if missing_salary_ids:
+        missing_list = ", ".join(map(str, missing_salary_ids[:10]))
+        suffix = "..." if len(missing_salary_ids) > 10 else ""
+        st.error(f"❌ Salary data missing for employee_id: {missing_list}{suffix}")
+        st.stop()
     
     # Input parameters
     col1, col2 = st.columns(2)
