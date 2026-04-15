@@ -117,7 +117,7 @@ def parse_tanka_attendance(df):
         long_df["Raw_Attendance"].apply(parse_attendance)
     
     final_df = long_df.drop(columns="Raw_Attendance")
-    final_df["Date"] = pd.to_datetime(final_df["Date"], errors="coerce")
+    final_df["Date"] = pd.to_datetime(final_df["Date"], dayfirst=True, errors="coerce").dt.date
     
     # Normalize work hours
     final_df["Normalized_Work_Hrs"] = final_df["Worked_Hrs"].apply(get_normalized_hours)
@@ -125,13 +125,22 @@ def parse_tanka_attendance(df):
     # Rename OrgEmpCode to employee_id for internal consistency
     final_df["employee_id"] = final_df["OrgEmpCode"]
     
+    # Sort by OrgEmpCode then Date for readability
+    final_df = final_df.sort_values(["OrgEmpCode", "Date"]).reset_index(drop=True)
+    
     return final_df
 
 # ============================================================================
 # HELPER FUNCTIONS - BIOMETRIC PARSER
 # ============================================================================
 def parse_biometric_attendance(df, source_name=None):
-    """Parse Biometric format attendance data from employee-wise monthly blocks."""
+    """Parse Biometric format attendance data from employee-wise monthly blocks.
+
+    Auto-detects two cell formats:
+      OLD (8-part): Shift\\nInTime\\nOutTime\\nLateMins\\nEarlyDep\\nOTHrs\\nWorkHrs\\nStatus
+      NEW (6-part): InTime\\nOutTime\\nLateMins\\nEarlyDep\\nWorkHrs\\nStatus
+    Also handles the difference in Emp Name column position (col 3 OLD vs col 4 NEW).
+    """
 
     def calc_work_hours(in_t, out_t):
         """Calculate work hours from in and out times."""
@@ -149,95 +158,160 @@ def parse_biometric_attendance(df, source_name=None):
         except Exception:
             return "0:00"
 
-    def extract_value(row, label):
-        for val in row:
-            text = str(val).strip()
-            if label in text:
-                return text.split(":", 1)[1].strip()
-        return None
-
-    def split_attendance_cell(cell_value):
-        if pd.isna(cell_value):
-            return []
-        return [part.strip() for part in str(cell_value).split("\n")]
-
     def infer_period_from_source(name):
         if not name:
             return datetime.now().year, datetime.now().month
+        base = str(name).lower()
 
-        base_name = str(name)
+        month_names = {
+            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+        }
+        for abbr, num in month_names.items():
+            m = re.search(rf'({abbr})[a-z]*[-_ ]?(20\d{{2}})', base)
+            if m:
+                return int(m.group(2)), num
+            m = re.search(rf'(20\d{{2}})[-_ ]?({abbr})[a-z]*', base)
+            if m:
+                return int(m.group(1)), num
 
-        # Supports names like 03-2026, 03_2026, 2026-03, 04-03-2026, etc.
-        month_year = re.search(r'(?<!\d)(0?[1-9]|1[0-2])[-_/](20\d{2})(?!\d)', base_name)
+        month_year = re.search(r'(?<!\d)(0?[1-9]|1[0-2])[-_/](20\d{2})(?!\d)', str(name))
         if month_year:
             return int(month_year.group(2)), int(month_year.group(1))
-
-        year_month = re.search(r'(?<!\d)(20\d{2})[-_/](0?[1-9]|1[0-2])(?!\d)', base_name)
+        year_month = re.search(r'(?<!\d)(20\d{2})[-_/](0?[1-9]|1[0-2])(?!\d)', str(name))
         if year_month:
             return int(year_month.group(1)), int(year_month.group(2))
-
-        full_date = re.search(r'(?<!\d)(0?[1-9]|[12]\d|3[01])[-_/](0?[1-9]|1[0-2])[-_/](20\d{2})(?!\d)', base_name)
+        full_date = re.search(r'(?<!\d)(0?[1-9]|[12]\d|3[01])[-_/](0?[1-9]|1[0-2])[-_/](20\d{2})(?!\d)', str(name))
         if full_date:
             return int(full_date.group(3)), int(full_date.group(2))
 
         return datetime.now().year, datetime.now().month
 
+    def infer_period_from_df(df):
+        """Fallback: try to extract year/month from the file's first-row period header."""
+        try:
+            first_cell = str(df.iloc[0, 0])
+            m = re.search(r'(\d{2})/(\d{2})/(\d{4})', first_cell)
+            if m:
+                return int(m.group(3)), int(m.group(2))
+        except Exception:
+            pass
+        return None, None
+
+    def detect_cell_format(df, emp_rows):
+        """Return 'old' (8-part) or 'new' (6-part) based on first data cells found."""
+        for emp_row_idx in emp_rows[:3]:
+            data_row_idx = emp_row_idx + 4
+            if data_row_idx >= len(df):
+                continue
+            data_row = df.iloc[data_row_idx]
+            for col_idx in range(1, min(10, len(data_row))):
+                cell = data_row.iloc[col_idx]
+                if pd.notna(cell):
+                    parts = [p.strip() for p in str(cell).split("\n")]
+                    if len(parts) >= 8:
+                        return 'old'
+                    elif len(parts) >= 6:
+                        return 'new'
+        return 'old'
+
     records = []
     year, month = infer_period_from_source(source_name)
-    current_emp_id = None
-    current_emp_name = None
-    current_day_numbers = {}
 
-    for _, row in df.iterrows():
-        row_str = " ".join(row.fillna("").astype(str))
-        first_cell = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+    # Fallback: read period from file header row if filename gave nothing useful
+    if year == datetime.now().year and month == datetime.now().month:
+        y2, m2 = infer_period_from_df(df)
+        if y2 and m2:
+            year, month = y2, m2
 
-        if "Emp Code :" in row_str:
-            current_emp_id = extract_value(row, "Emp Code")
-            current_emp_name = extract_value(row, "Emp Name")
-            current_day_numbers = {}
+    emp_rows = df[df[0].astype(str).str.contains("Emp Code", na=False)].index.tolist()
+    if not emp_rows:
+        return pd.DataFrame()
+
+    # Auto-detect cell format once for the whole file
+    fmt = detect_cell_format(df, emp_rows)
+
+    for emp_row_idx in emp_rows:
+        row_vals = df.iloc[emp_row_idx]
+        current_emp_id = None
+        current_emp_name = None
+
+        for col_idx, v in enumerate(row_vals):
+            if pd.isna(v):
+                continue
+            v_str = str(v)
+            if "Emp Code" in v_str:
+                current_emp_id = v_str.split(":", 1)[1].strip()
+            if "Emp Name" in v_str:
+                current_emp_name = v_str.split(":", 1)[1].strip()
+
+        if not current_emp_id:
             continue
 
-        if current_emp_id and any(str(val).strip().isdigit() for val in row.iloc[1:] if pd.notna(val)):
-            current_day_numbers = {}
-            for col_idx in range(1, len(row)):
-                value = str(row.iloc[col_idx]).strip() if pd.notna(row.iloc[col_idx]) else ""
-                if value.isdigit():
-                    current_day_numbers[col_idx] = int(value)
+        data_row_idx = emp_row_idx + 4
+        if data_row_idx >= len(df):
             continue
 
-        if current_emp_id and first_cell.startswith("In Time"):
-            for col_idx, day_num in current_day_numbers.items():
-                parts = split_attendance_cell(row.iloc[col_idx])
-                if not parts:
+        data_row = df.iloc[data_row_idx]
+
+        for day_num, col_idx in enumerate(range(1, 32), start=1):
+            if col_idx >= len(data_row):
+                continue
+            cell = data_row.iloc[col_idx]
+            if pd.isna(cell):
+                continue
+
+            parts = [p.strip() for p in str(cell).split("\n")]
+
+            if fmt == 'old':
+                # OLD: [0]=Shift [1]=InTime [2]=OutTime [3]=LateMins
+                #      [4]=EarlyDep [5]=OTHrs [6]=WorkHrs [7]=Status
+                if len(parts) < 8:
                     continue
-
-                padded_parts = (parts + [""] * 6)[:6]
-                in_t, out_t, late_mins, early_dep, work_hours, status = padded_parts
-
-                try:
-                    date_obj = datetime(year, month, day_num)
-                except ValueError:
+                in_t      = parts[1] or None
+                out_t     = parts[2] or None
+                late_mins = parts[3]
+                early_dep = parts[4]
+                ot_hrs    = parts[5]
+                work_hrs  = parts[6]
+                status    = parts[7]
+            else:
+                # NEW: [0]=InTime [1]=OutTime [2]=LateMins
+                #      [3]=EarlyDep [4]=WorkHrs [5]=Status
+                if len(parts) < 6:
                     continue
+                in_t      = parts[0] or None
+                out_t     = parts[1] or None
+                late_mins = parts[2]
+                early_dep = parts[3]
+                ot_hrs    = ""
+                work_hrs  = parts[4]
+                status    = parts[5]
 
-                calc_hrs = calc_work_hours(in_t, out_t)
-                effective_hours = work_hours if work_hours and work_hours != "0:00" else calc_hrs
+            try:
+                date_obj = datetime(year, month, day_num)
+            except ValueError:
+                continue
 
-                records.append({
-                    "employee_id": current_emp_id,
-                    "emp_id": current_emp_id,
-                    "emp_name": current_emp_name,
-                    "date": date_obj.strftime("%Y-%m-%d"),
-                    "day_name": date_obj.strftime("%A"),
-                    "in_time": in_t,
-                    "out_time": out_t,
-                    "late_mins": late_mins,
-                    "early_dep": early_dep,
-                    "work_hours": work_hours,
-                    "calc_hrs": calc_hrs,
-                    "effective_hours": effective_hours,
-                    "status": status
-                })
+            calc_hrs = calc_work_hours(in_t, out_t)
+            effective_hours = work_hrs if work_hrs and work_hrs != "0:00" else calc_hrs
+
+            records.append({
+                "employee_id":     current_emp_id,
+                "emp_id":          current_emp_id,
+                "emp_name":        current_emp_name,
+                "date":            date_obj.strftime("%Y-%m-%d"),
+                "day_name":        date_obj.strftime("%A"),
+                "in_time":         in_t,
+                "out_time":        out_t,
+                "late_mins":       late_mins,
+                "early_dep":       early_dep,
+                "ot_hrs":          ot_hrs,
+                "work_hours":      work_hrs,
+                "calc_hrs":        calc_hrs,
+                "effective_hours": effective_hours,
+                "status":          status,
+            })
 
     attendance_df = pd.DataFrame(records)
 
@@ -298,8 +372,8 @@ else:  # Biometric
     st.caption("Expected format: Employee-wise monthly blocks with Emp Code, Emp Name, day-number row, and multiline daily attendance cells")
     
     attendance_file = st.file_uploader(
-        "📁 Upload Biometric Attendance File (.xlsx)",
-        type=["xlsx"],
+        "📁 Upload Biometric Attendance File (.xlsx or .xls)",
+        type=["xlsx", "xls"],
         key="attendance_upload_bio"
     )
     
@@ -307,7 +381,10 @@ else:  # Biometric
         st.info("✓ Attendance file uploaded")
         
         try:
-            df = pd.read_excel(attendance_file)
+            if attendance_file.name.lower().endswith(".xls"):
+                df = pd.read_excel(attendance_file, engine="xlrd", header=None)
+            else:
+                df = pd.read_excel(attendance_file, header=None)
             final_df = parse_biometric_attendance(df, attendance_file.name)
             
             if len(final_df) == 0:
@@ -562,8 +639,8 @@ if attendance_input and salary_input:
             'Paid_Weekend',
             'leverage_hr',
             'leverage_amount',
-            'deduction',
             'net_salary',
+            'deduction',
             'Final_salary'
         ]
         
@@ -603,6 +680,6 @@ if 'payroll_report' in st.session_state:
         key="download_payroll"
     )
     
-    st.info(f"✓ Report ready with {len(payroll_report)} employees")
+    st.info("✓ Payroll Report ready")
 else:
     st.warning("⚠️ Complete Section 2 to generate payroll report")
